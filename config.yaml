@@ -1,0 +1,31 @@
+# cfg.yaml
+paths:
+  train_dir: data/train
+  val_dir:   data/val
+  artifacts: artifacts
+  ckpt: artifacts/checkpoints/best.pt
+
+image:
+  height: 160
+  max_width: 1024
+
+model:
+  d_model: 320
+  heads: 4
+  layers: 4
+  ff_dim: 768
+  dropout: 0.1
+
+train:
+  batch_size: 12
+  epochs: 12
+  lr_encoder: 1.0e-4
+  lr_decoder: 3.0e-4
+  weight_decay: 1.0e-2
+  label_smoothing: 0.1
+  max_len: 512
+  patience: 3
+
+decode:
+  beam: 1          # 1=greedy, надо бы поменять позже
+  max_len: 256
