@@ -1,4 +1,4 @@
-# 🧮 Image2LaTeX
+# 🧮 Img2LaTeX
 
 This project turns images of mathematical formulas into LaTeX code.  
 It uses a small custom CNN to read the image and a Transformer decoder to write the formula.  
