@@ -1,142 +1,119 @@
-# -----------------------------------------------------------
-# core/encoder.py
-# this encoder turns math formula images into feature sequences.
-# uses coordconv (adds x/y coords), depthwise convs, SE-blocks,
-# residual connections and droppath for regularization.
-# mostly downsamples height but keeps width to preserve reading order.
-# final output: (B, S, D) for the transformer decoder.
-# -----------------------------------------------------------
-
-
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Tuple
+from torch import nn, Tensor
 
+class ConvRowEncoder(nn.Module):
+  """
+  Conv row BiLSTM features extractor.
 
+  Input: (B, C, H, W)
+  Output: (B, S, enc_dim_out) 
+  S = H' * W'
+  enc_dim_out = 2 * enc_dim
+  """
+  def __init__(self, enc_dim: int, in_channels = 1):
+    super().__init__()
+    self.encoder = nn.Sequential(
+      nn.Conv2d(in_channels, 64, kernel_size = 1, stride = 1),
+      nn.ReLU(inplace = True),
 
-class DropPath(nn.Module):
-    def __init__(self, p: float = 0.0):
-        super().__init__()
-        self.p = p
-    def forward(self, x):
-        if not self.training or self.p == 0.0:
-            return x
-        keep = 1 - self.p
-        shape = (x.size(0),) + (1,) * (x.ndim - 1)
-        return x + (torch.rand(shape, device=x.device) < self.p).float() * (-x / keep)
+      nn.Conv2d(64, 128, kernel_size = 3, stride = 1, padding = 1),
+      nn.ReLU(inplace = True),
+      nn.MaxPool2d(2, 2), # h/2, w/2
 
-def make_coord(batch: int, h: int, w: int, device) -> torch.Tensor:
+      nn.Conv2d(128, 256, kernel_size = 3, stride = 1, padding = 1),
+      nn.BatchNorm2d(256),
+      nn.ReLU(inplace = True),
 
-    y = torch.linspace(-1, 1, steps=h, device=device).view(1, 1, h, 1).expand(batch, 1, h, w)
-    x = torch.linspace(-1, 1, steps=w, device=device).view(1, 1, 1, w).expand(batch, 1, h, w)
-    return torch.cat([y, x], dim=1)
+      nn.Conv2d(256, 256, kernel_size = 3, stride = 1, padding = 1),
+      nn.ReLU(inplace = True),
+      nn.MaxPool2d(kernel_size = (2, 1), stride = (2, 1)), # h/4, w/2
 
+      nn.Conv2d(256, 512, kernel_size = 3, stride = 1, padding = 1),
+      nn.BatchNorm2d(512),
+      nn.ReLU(inplace = True),
+      nn.MaxPool2d(kernel_size = (1, 2), stride = (1, 2)), # h/4, w/4
 
-class ConvBNAct(nn.Module):
-    def __init__(self, ci, co, k=3, s=1, p=1, groups=1):
-        super().__init__()
-        self.conv = nn.Conv2d(ci, co, k, stride=s, padding=p, groups=groups, bias=False)
-        self.bn   = nn.BatchNorm2d(co)
-        self.act  = nn.ReLU(inplace=True)
-    def forward(self, x): return self.act(self.bn(self.conv(x)))
+      nn.Conv2d(512, 512, kernel_size = 3, stride = 1, padding = 1),
+      nn.BatchNorm2d(512),
+      nn.ReLU(inplace = True)
+    )
 
-class SE(nn.Module):
-    def __init__(self, c: int, r: int = 16):
-        super().__init__()
-        self.fc1 = nn.Conv2d(c, c // r, 1)
-        self.fc2 = nn.Conv2d(c // r, c, 1)
-    def forward(self, x):
-        s = F.adaptive_avg_pool2d(x, 1)
-        s = F.relu(self.fc1(s), inplace=True)
-        s = torch.sigmoid(self.fc2(s))
-        return x * s
+    self.row_enc = nn.LSTM(
+      input_size = 512,
+      hidden_size = enc_dim,
+      num_layers = 1,
+      batch_first = True,
+      bidirectional = True
+    )
 
-class DSConv(nn.Module):
-    def __init__(self, ci, co, s=1):
-        super().__init__()
-        self.dw = ConvBNAct(ci, ci, k=3, s=s, p=1, groups=ci)
-        self.pw = ConvBNAct(ci, co, k=1, s=1, p=0, groups=1)
-    def forward(self, x): return self.pw(self.dw(x))
+    self.enc_dim = enc_dim * 2
+    
 
-class ResidualDS(nn.Module):
-    def __init__(self, c, s=1, droppath=0.0, use_se=True):
-        super().__init__()
-        self.conv1 = DSConv(c, c, s=s)
-        self.conv2 = DSConv(c, c, s=1)
-        self.se = SE(c) if use_se else nn.Identity()
-        self.short = nn.Identity()
-        self.dp = DropPath(droppath)
-    def forward(self, x):
-        y = self.conv2(self.conv1(x))
-        y = self.se(y)
-        return x + self.dp(y)
+  def forward(self, x: Tensor) -> Tensor:
+    """
+    images: (B, C, H, W)
+    output: (B, S, enc_dim_out), S = H' * W'
+    """
 
-class DownStage(nn.Module):
+    conv_out = self.encoder(x) # (B, 512, H', W')
 
-    def __init__(self, ci, co, stride_hw: Tuple[int,int]=(2,2)):
-        super().__init__()
-        sh, sw = stride_hw
-        self.down = ConvBNAct(ci, co, k=3, s=1, p=1)
+    B, C, Hp, Wp = conv_out.size()
 
-        self.pool = nn.AvgPool2d(kernel_size=(sh, sw), stride=(sh, sw))
-    def forward(self, x):
-        x = self.down(x)
-        return self.pool(x)
+    conv_out = conv_out.permute(0, 2, 3, 1) # (B, H', W', C)
 
+    lstm_out = []
+    for r in range(Hp):
+      row_data = conv_out[:, r, :, :] # (B, W', C = 512)
+      # lstm needs (B, seq_len, input_size)
+      row_out, _ = self.row_enc(row_data) # (B, W', enc_dim * 2)
+      lstm_out.append(row_out)
 
-class CNNEncoder(nn.Module):
-    def __init__(self, d_model: int = 384, base_c: int = 64, depth: Tuple[int,int,int]=(2,2,2),
-                 droppath_max: float = 0.1, coordconv: bool = True):
+    enc_out = torch.stack(lstm_out, dim = 1) # (B, H', W', enc_dim * 2)
+    B, Hp2, Wp2, D = enc_out.size()
+    enc_out = enc_out.view(B, Hp2 * Wp2, D) # (B, S, enc_dim * 2)
 
-        super().__init__()
-        self.coordconv = coordconv
-        stem_in = 1 + (2 if coordconv else 0)
-        self.stem = nn.Sequential(
-            ConvBNAct(stem_in, base_c, k=3, s=1, p=1),
-            ConvBNAct(base_c, base_c, k=3, s=1, p=1),
-        )
+    return enc_out
+  
 
-        C1 = base_c
-        C2 = base_c * 2
-        C3 = base_c * 4
+class ConvEncoder(nn.Module):
+  """
+  CNN encoder
+  Input: (B, C, H, W)
+  Output: (B, S, enc_dim) S = H' * W'
+  """
+  def __init__(self, enc_dim: int, in_channels: int = 1):
+    super().__init__()
+    self.encoder = nn.Sequential(
+      nn.Conv2d(in_channels, 64, kernel_size = 3, stride = 1, padding = 1),
+      nn.ReLU(inplace = True),
 
+      nn.Conv2d(64, 128, kernel_size = 3, stride = 1, padding = 1),
+      nn.ReLU(inplace = True),
 
-        self.stage1_down = DownStage(C1, C2, stride_hw=(2,2))
-        self.stage2_down = DownStage(C2, C3, stride_hw=(2,1))
+      nn.Conv2d(128, 256, kernel_size = 3, stride = 1, padding = 1),
+      nn.ReLU(inplace = True),
 
+      nn.Conv2d(256, 256, kernel_size = 3, stride = 1, padding = 1),
+      nn.ReLU(inplace = True),
+      nn.MaxPool2d(kernel_size = (2, 1), stride = (2, 1)), # h/2 w
 
-        total_blocks = sum(depth)
-        idx = 0
-        self.stage1 = nn.Sequential(*[
-            ResidualDS(C2, s=1, droppath=droppath_max * (idx:=idx+1)/total_blocks) for _ in range(depth[0])
-        ])
-        self.stage2 = nn.Sequential(*[
-            ResidualDS(C3, s=1, droppath=droppath_max * (idx:=idx+1)/total_blocks) for _ in range(depth[1])
-        ])
-        self.stage3 = nn.Sequential(*[
-            ResidualDS(C3, s=1, droppath=droppath_max * (idx:=idx+1)/total_blocks) for _ in range(depth[2])
-        ])
+      nn.Conv2d(256, 512, kernel_size = 3, stride = 1, padding = 1),
+      nn.ReLU(inplace = True),
+      nn.MaxPool2d(kernel_size = (1, 2), stride = (1, 2)), # h/2 w/2
 
-        self.proj = nn.Linear(C3, d_model)
+      nn.Conv2d(512, enc_dim, kernel_size = 3, stride = 1, padding = 1) # (B, enc_dim, H', W')
+    )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    self.enc_dim = enc_dim
 
-        B, _, H, W = x.shape
-        if self.coordconv:
-            coord = make_coord(B, H, W, x.device)
-            x = torch.cat([x, coord], dim=1)
+  def forward(self, x: Tensor) -> Tensor:
+    """
+    x: (B, C, H, W)
+    output: (B, S, enc_dim) S = H' * W'
+    """
+    feats = self.encoder(x) # (B, enc_dim, H', W')
+    B, D, Hp, Wp = feats.size()
+    feats = feats.permute(0, 2, 3, 1) # (B, H', W', D)
+    enc_out = feats.contiguous().view(B, Hp * Wp, D) # (B, S, enc_dim)
 
-        x = self.stem(x)
-        x = self.stage1_down(x)
-        x = self.stage1(x)
-
-        x = self.stage2_down(x)
-        x = self.stage2(x)
-
-        x = self.stage3(x)
-
-
-        x = x.mean(dim=2)
-        x = x.permute(0, 2, 1).contiguous()
-        return self.proj(x)
+    return enc_out

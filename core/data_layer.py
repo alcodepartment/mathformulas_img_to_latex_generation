@@ -1,6 +1,6 @@
 import os
 import csv
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Optional
 from tokenizer import Tokenizer
 
 import torch
@@ -22,7 +22,7 @@ class Image2LatexDataset(Dataset):
       csv_path: str,
       root_dir: str,
       tokenizer: Tokenizer,
-      img_height: int = 128,
+      img_height: int = 64,
       transform: Optional[T.Compose] = None
   ):
     self.csv_path = csv_path
@@ -139,10 +139,10 @@ def make_loader(
     csv_path: str,
     root_dir: str,
     tokenizer: Tokenizer,
-    batch_size: int = 64,
+    batch_size: int = 20,
     shuffle: bool = True,
     num_workers: int = 4,
-    img_height: int = 128
+    img_height: int = 64
 ) -> DataLoader:
   dataset = Image2LatexDataset(
     csv_path,
