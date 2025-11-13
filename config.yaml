@@ -1,31 +1,50 @@
 # cfg.yaml
+
 paths:
   train_dir: data/train
-  val_dir:   data/val
+  val_dir: data/val
+
   artifacts: artifacts
+  checkpoints: artifacts/checkpoints
+  logs: artifacts/logs
+  samples: artifacts/samples
+
+
   ckpt: artifacts/checkpoints/best.pt
+
+
+  encoder: core/encoder.py
+  decoder: core/decoder.py
+  tokenizer: core/tokenizer.py
+
+  notebook: notebook.ipynb
 
 image:
   height: 160
   max_width: 1024
+  channels: 1
 
 model:
+  type: lstm_bahdanau
   d_model: 320
-  heads: 4
-  layers: 4
-  ff_dim: 768
+  hidden_size: 320
+  attn_size: 256
   dropout: 0.1
 
 train:
   batch_size: 12
   epochs: 12
+
   lr_encoder: 1.0e-4
   lr_decoder: 3.0e-4
   weight_decay: 1.0e-2
   label_smoothing: 0.1
+
   max_len: 512
   patience: 3
+  grad_clip: 1.0
 
 decode:
-  beam: 1          # 1=greedy, надо бы поменять позже
+  beam: 1
   max_len: 256
+  temperature: 1.0

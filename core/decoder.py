@@ -1,150 +1,171 @@
 # -----------------------------------------------------------
 # core/decoder.py
-# transformer decoder that generates LaTeX tokens step-by-step.
-# includes rmsnorm (prenorm), rotary positional encoding (rope),
-# swiglu feed-forward blocks, droppath regularization, and mha.
-# each layer: self-attn → cross-attn → ff. outputs logits for vocab.
+# unidirectional lstm decoder with bahdanau attention,
+# using input-feeding (emb_t + prev context) and coverage
+# (cumulative attention over encoder steps) to reduce skips
+# and repeats when generating LaTeX tokens.
 # -----------------------------------------------------------
 
-
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional, Tuple
 
-def apply_rotary(x, cos, sin):
-    x1, x2 = x[..., ::2], x[..., 1::2]
-    xr = torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
-    return xr.flatten(-2)
 
-def build_rotary_cache(seq_len, head_dim, device, base=10000.0):
-    pos = torch.arange(seq_len, device=device).float()
-    inv = 1.0 / (base ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
-    freqs = torch.einsum("i,j->ij", pos, inv)
-    cos = torch.cos(freqs).repeat_interleave(2, dim=-1)
-    sin = torch.sin(freqs).repeat_interleave(2, dim=-1)
-    return cos.unsqueeze(0).unsqueeze(0), sin.unsqueeze(0).unsqueeze(0)
-
-class RMSNorm(nn.Module):
-    def __init__(self, d, eps=1e-6):
+class BahdanauAttention(nn.Module):
+    def __init__(self, hidden_size: int, memory_size: int, attn_size: int, use_coverage: bool = True):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(d))
-        self.eps = eps
-    def forward(self, x):
-        n = x.pow(2).mean(dim=-1, keepdim=True).add_(self.eps).rsqrt_()
-        return self.weight * x * n
+        self.use_coverage = use_coverage
+        self.W_h = nn.Linear(hidden_size, attn_size, bias=False)
+        self.W_m = nn.Linear(memory_size, attn_size, bias=False)
+        if use_coverage:
+            self.W_c = nn.Linear(1, attn_size, bias=False)
+        else:
+            self.W_c = None
+        self.v = nn.Linear(attn_size, 1, bias=False)
 
-class SwiGLU(nn.Module):
-    def __init__(self, d_model, d_ff):
-        super().__init__()
-        self.w1 = nn.Linear(d_model, d_ff)
-        self.w2 = nn.Linear(d_model, d_ff)
-        self.w3 = nn.Linear(d_ff, d_model)
-    def forward(self, x):
-        return self.w3(F.silu(self.w1(x)) * self.w2(x))
+    def forward(
+        self,
+        hidden: torch.Tensor,                   # (B, H)
+        memory: torch.Tensor,                   # (B, S, D)
+        mem_pad: Optional[torch.Tensor] = None, # (B, S) True for PAD
+        coverage: Optional[torch.Tensor] = None # (B, S) cumulative attn
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        returns:
+          context: (B, D)
+          attn_weights: (B, S)
+        """
+        B, S, _ = memory.shape
 
-class MHA(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1):
+        h = self.W_h(hidden).unsqueeze(1)  # (B,1,A)
+        m = self.W_m(memory)               # (B,S,A)
+
+        if self.use_coverage:
+            if coverage is None:
+                coverage = torch.zeros(B, S, device=memory.device, dtype=memory.dtype)
+            c_feat = self.W_c(coverage.unsqueeze(-1))   # (B,S,1)->(B,S,A)
+            score = self.v(torch.tanh(h + m + c_feat)).squeeze(-1)  # (B,S)
+        else:
+            score = self.v(torch.tanh(h + m)).squeeze(-1)          # (B,S)
+
+        if mem_pad is not None:
+            score = score.masked_fill(mem_pad, float("-inf"))
+
+        attn_weights = F.softmax(score, dim=-1)                    # (B,S)
+        context = torch.bmm(attn_weights.unsqueeze(1), memory).squeeze(1)  # (B,D)
+        return context, attn_weights
+
+
+class LSTMDecoder(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 320,
+        hidden_size: int = 320,
+        attn_size: int = 256,
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        self.h = n_heads
-        self.dh = d_model // n_heads
-        self.q_proj = nn.Linear(d_model, d_model, bias=False)
-        self.k_proj = nn.Linear(d_model, d_model, bias=False)
-        self.v_proj = nn.Linear(d_model, d_model, bias=False)
-        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.hidden_size = hidden_size
+
+        self.emb = nn.Embedding(vocab_size, d_model)
+
+        # input-feeding: [emb_t, ctx_{t-1}] -> LSTMCell
+        self.lstm_cell = nn.LSTMCell(d_model + d_model, hidden_size)
+
+        self.attn = BahdanauAttention(
+            hidden_size=hidden_size,
+            memory_size=d_model,
+            attn_size=attn_size,
+            use_coverage=True,
+        )
+
+        self.fc_ctx = nn.Linear(hidden_size + d_model, d_model)
+        self.fc_out = nn.Linear(d_model, vocab_size)
+
         self.drop = nn.Dropout(dropout)
 
-    def _split(self, x):
-        B, T, D = x.shape
-        return x.view(B, T, self.h, self.dh).transpose(1, 2)
-    def _merge(self, x):
-        B, H, T, Dh = x.shape
-        return x.transpose(1, 2).contiguous().view(B, T, H * Dh)
+        self.init_h = nn.Linear(d_model, hidden_size)
+        self.init_c = nn.Linear(d_model, hidden_size)
 
-    def forward(self, q, k, v, attn_mask=None, key_padding_mask=None, rope_cache=None, need_weights=False):
-        q = self._split(self.q_proj(q))
-        k = self._split(self.k_proj(k))
-        v = self._split(self.v_proj(v))
-        if rope_cache is not None:
-            cos, sin = rope_cache
-            Tq, Tk = q.size(2), k.size(2)
-            q = apply_rotary(q, cos[:, :, :Tq, :], sin[:, :, :Tq, :])
-            k = apply_rotary(k, cos[:, :, :Tk, :], sin[:, :, :Tk, :])
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.dh)
-        if attn_mask is not None:
-            scores = scores + attn_mask
-        if key_padding_mask is not None:
-            pad = key_padding_mask[:, None, None, :].to(scores.dtype)
-            scores = scores.masked_fill(pad.bool(), float("-inf"))
-        attn = F.softmax(scores, dim=-1)
-        attn = self.drop(attn)
-        out = torch.matmul(attn, v)
-        out = self.o_proj(self._merge(out))
-        if need_weights:
-            return out, attn.mean(dim=1)
-        return out, None
+    def init_state(
+        self,
+        memory: torch.Tensor,
+        mem_pad: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        memory: (B, S, D)
+        mem_pad: (B, S) or None
+        returns: h0, c0 of shape (B, H)
+        """
+        if mem_pad is not None:
+            mask = ~mem_pad
+            mask_f = mask.float()
+            denom = mask_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+            m = (memory * mask_f.unsqueeze(-1)).sum(dim=1) / denom
+        else:
+            m = memory.mean(dim=1)
 
-class DropPath(nn.Module):
-    def __init__(self, p=0.0):
-        super().__init__()
-        self.p = p
-    def forward(self, x):
-        if not self.training or self.p == 0.0:
-            return x
-        keep = 1 - self.p
-        shape = (x.size(0),) + (1,) * (x.ndim - 1)
-        return x + (torch.rand(shape, device=x.device) < self.p).float() * (-x / keep)
+        h0 = torch.tanh(self.init_h(m))
+        c0 = torch.tanh(self.init_c(m))
+        return h0, c0
 
-class StrongDecoderLayer(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, drop=0.1, droppath=0.1):
-        super().__init__()
-        self.norm1 = RMSNorm(d_model)
-        self.self_attn = MHA(d_model, n_heads, dropout=drop)
-        self.drop1 = nn.Dropout(drop)
-        self.dp1 = DropPath(droppath)
-        self.norm2 = RMSNorm(d_model)
-        self.cross_attn = MHA(d_model, n_heads, dropout=drop)
-        self.drop2 = nn.Dropout(drop)
-        self.dp2 = DropPath(droppath)
-        self.norm3 = RMSNorm(d_model)
-        self.ff = SwiGLU(d_model, d_ff)
-        self.drop3 = nn.Dropout(drop)
-        self.dp3 = DropPath(droppath)
+    def forward(
+        self,
+        memory: torch.Tensor,                   # (B, S, D)
+        tgt_ids: torch.Tensor,                  # (B, T)
+        mem_pad: Optional[torch.Tensor] = None, # (B, S) True for PAD
+        need_xattn: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Teacher forcing: processes all target tokens in one pass.
 
-    def forward(self, x, mem, self_mask, mem_pad, rope_cache, need_xattn=False):
-        y, _ = self.self_attn(self.norm1(x), self.norm1(x), self.norm1(x), attn_mask=self_mask, rope_cache=rope_cache)
-        x = x + self.dp1(self.drop1(y))
-        y, xattn = self.cross_attn(self.norm2(x), mem, mem, key_padding_mask=mem_pad, need_weights=need_xattn)
-        x = x + self.dp2(self.drop2(y))
-        y = self.ff(self.norm3(x))
-        x = x + self.dp3(self.drop3(y))
-        return x, xattn
+        returns:
+          logits: (B, T, V)
+          attn_seq: (B, T, S) if need_xattn else None
+        """
+        B, S, D = memory.shape
+        _, T = tgt_ids.shape
+        device = memory.device
 
-class StrongTransformerDecoder(nn.Module):
-    def __init__(self, vocab_size, d_model=320, n_heads=4, d_ff=768, n_layers=6, drop=0.1, droppath=0.1, max_len=4096):
-        super().__init__()
-        self.emb = nn.Embedding(vocab_size, d_model)
-        self.layers = nn.ModuleList([
-            StrongDecoderLayer(d_model, n_heads, d_ff, drop=drop, droppath=droppath * (i+1) / n_layers)
-            for i in range(n_layers)
-        ])
-        self.proj = nn.Linear(d_model, vocab_size, bias=False)
-        self.max_len = max_len
+        emb = self.emb(tgt_ids)  # (B,T,E)
 
-    def _causal_mask(self, T, device):
-        m = torch.full((T, T), float("-inf"), device=device)
-        return torch.triu(m, diagonal=1)
+        h_t, c_t = self.init_state(memory, mem_pad)  # (B,H), (B,H)
 
-    def forward(self, memory, tgt_ids, mem_pad=None, need_xattn=False):
-        B, T = tgt_ids.size()
-        x = self.emb(tgt_ids)
-        mask = self._causal_mask(T, x.device)
-        cos, sin = build_rotary_cache(T, x.size(-1), x.device)
-        last_xattn = None
-        for i, layer in enumerate(self.layers):
-            need = (need_xattn and i == len(self.layers) - 1)
-            x, xattn = layer(x, memory, mask, mem_pad, (cos, sin), need_xattn=need)
-            if xattn is not None:
-                last_xattn = xattn
-        logits = self.proj(x)
-        return logits, last_xattn
+        ctx_prev = torch.zeros(B, D, device=device, dtype=memory.dtype)  # (B,D)
+        coverage = torch.zeros(B, S, device=device, dtype=memory.dtype)  # (B,S)
+
+        logits = []
+        attn_seq = [] if need_xattn else None
+
+        for t in range(T):
+            x_t = emb[:, t, :]                          # (B,E)
+            lstm_in = torch.cat([x_t, ctx_prev], dim=-1)  # (B,E+D)
+            h_t, c_t = self.lstm_cell(lstm_in, (h_t, c_t))
+
+            ctx_t, alpha_t = self.attn(h_t, memory, mem_pad=mem_pad, coverage=coverage)  # (B,D),(B,S)
+
+            coverage = coverage + alpha_t
+
+            dec_feat = torch.cat([h_t, ctx_t], dim=-1)  # (B,H+D)
+            dec_feat = self.drop(torch.tanh(self.fc_ctx(dec_feat)))  # (B,D)
+
+            logit_t = self.fc_out(dec_feat)  # (B,V)
+            logits.append(logit_t.unsqueeze(1))
+
+            if need_xattn:
+                attn_seq.append(alpha_t.unsqueeze(1))
+
+            ctx_prev = ctx_t
+
+        logits = torch.cat(logits, dim=1)  # (B,T,V)
+
+        if need_xattn and attn_seq:
+            attn_seq = torch.cat(attn_seq, dim=1)  # (B,T,S)
+        else:
+            attn_seq = None
+
+        return logits, attn_seq
