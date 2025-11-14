@@ -117,3 +117,47 @@ class ConvEncoder(nn.Module):
     enc_out = feats.contiguous().view(B, Hp * Wp, D) # (B, S, enc_dim)
 
     return enc_out
+  
+class ConvEncoder1D(nn.Module):
+  """
+  Very light CNN encoder.
+
+  Input: images (B, C, H, W)
+  Output: memory (B, S, D), S = W' D = enc_dim
+  """
+  def __init__(self, enc_dim: int, in_channels: int = 1, base_channels: int = 64):
+    super().__init__()
+
+    self.cnn = nn.Sequential(
+      nn.Conv2d(in_channels, base_channels, 3, 1, 1),
+      nn.BatchNorm2d(base_channels),
+      nn.ReLU(inplace=True),
+      nn.MaxPool2d(2, 2),
+
+      nn.Conv2d(base_channels, base_channels * 2, 3, 1, 1),
+      nn.BatchNorm2d(base_channels * 2),
+      nn.ReLU(inplace=True),
+      nn.MaxPool2d(2, 2),
+
+      nn.Conv2d(base_channels * 2, base_channels * 4, 3, 1, 1),
+      nn.BatchNorm2d(base_channels * 4),
+      nn.ReLU(inplace=True),
+      nn.MaxPool2d(2, 2),
+
+      nn.Conv2d(base_channels * 4, enc_dim, 3, 1, 1),
+      nn.BatchNorm2d(enc_dim),
+      nn.ReLU(inplace=True),
+    )
+
+    self.enc_dim = enc_dim
+
+  def forward(self, x: Tensor) -> Tensor:
+    """
+    x: (B, C, H, W)
+    return: (B, S, enc_dim) with S = W'
+    """
+    feat = self.cnn(x) # (B, D, H', W')
+    B, D, Hp, Wp = feat.shape
+    feat_1d = feat.mean(dim=2) # (B, D, W')
+    feat_1d = feat_1d.permute(0, 2, 1) # (B, W', D)
+    return feat_1d
