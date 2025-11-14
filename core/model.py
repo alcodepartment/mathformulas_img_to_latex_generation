@@ -97,7 +97,7 @@ class Im2Latex(nn.Module):
     images: Tensor,
     sos_id: int,
     eos_id: int,
-    max_len: int = 512,
+    max_len: int = 150,
     mem_pad: Optional[Tensor] = None
   ) -> Tensor:
     """
