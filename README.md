@@ -1,3 +1,5 @@
+Created by Trubarov Nikita, Issayev Alen and Batyrkhanov Zhanserik
+
 cd ./core
 
 streamlit run ./app.py 
